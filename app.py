@@ -52,7 +52,8 @@ BUSINESS_POINTS = [
     "Monthly Product Analysis",
 ]
 
-REQUIRED_COLUMNS = ["Date", "Product", "Sales", "Quantity"]
+REQUIRED_COLUMNS = ["Date", "Vendor_Name", "Territory", "Product", "Quantity", "Price_Pce", "Sales", "Type"]
+
 
 
 # --------------------------------------------------------------------------
@@ -124,6 +125,7 @@ def load_and_clean(file_bytes: bytes, filename: str) -> pd.DataFrame:
     df["Sales"] = pd.to_numeric(df["Sales"], errors="coerce").fillna(0)
     df["Quantity"] = pd.to_numeric(df["Quantity"], errors="coerce").fillna(0)
     df["Month"] = df["Date"].dt.to_period("M").astype(str)
+    df = df[df['Type'] == 'Sales']
     return df
 
 
