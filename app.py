@@ -50,10 +50,10 @@ st.set_page_config(
 BUSINESS_POINTS = [
     "Monthly Sales Analysis",
     "Monthly Product Analysis",
+    "Monthly Product Profit Analysis",
 ]
 
 REQUIRED_COLUMNS = ["Date", "Vendor_Name", "Territory", "Product", "Quantity", "Price_Pce", "Sales", "Type"]
-
 
 
 # --------------------------------------------------------------------------
@@ -125,28 +125,51 @@ def load_and_clean(file_bytes: bytes, filename: str) -> pd.DataFrame:
     df["Sales"] = pd.to_numeric(df["Sales"], errors="coerce").fillna(0)
     df["Quantity"] = pd.to_numeric(df["Quantity"], errors="coerce").fillna(0)
     df["Month"] = df["Date"].dt.to_period("M").astype(str)
-    df = df[df['Type'] == 'Sales']
+    # Note: both 'Sales' and 'Purchase' rows are kept here — Monthly Sales
+    # and Monthly Product analysis filter down to 'Sales' rows themselves,
+    # while Monthly Product Profit analysis needs both types.
     return df
 
 
 def generate_sample_data(n_months: int = 12) -> pd.DataFrame:
     rng = np.random.default_rng(42)
     products = ["Widget A", "Widget B", "Gadget X", "Gadget Y", "Gizmo Z"]
+    vendors = ["Acme Supplies", "Northwind Traders", "Globex Co"]
+    territories = ["North", "South", "East", "West"]
+    unit_price = {"Widget A": 25, "Widget B": 40, "Gadget X": 120,
+                  "Gadget Y": 80, "Gizmo Z": 15}
+    unit_cost = {p: round(v * rng.uniform(0.55, 0.75), 2) for p, v in unit_price.items()}
+
     rows = []
     start = pd.Timestamp.today().normalize().replace(day=1) - pd.DateOffset(months=n_months - 1)
     for m in range(n_months):
         month_start = start + pd.DateOffset(months=m)
         days_in_month = pd.Period(month_start, freq="M").days_in_month
+        # Sales transactions
         for _ in range(60):
             day = rng.integers(1, days_in_month + 1)
             date = month_start.replace(day=int(day))
             product = rng.choice(products)
             qty = int(rng.integers(1, 20))
-            price = {"Widget A": 25, "Widget B": 40, "Gadget X": 120,
-                     "Gadget Y": 80, "Gizmo Z": 15}[product]
-            sales = qty * price * rng.uniform(0.9, 1.1)
-            rows.append([date, product, round(sales, 2), qty])
-    df = pd.DataFrame(rows, columns=["Date", "Product", "Sales", "Quantity"])
+            price = unit_price[product]
+            sales = round(qty * price * rng.uniform(0.9, 1.1), 2)
+            rows.append([date, rng.choice(vendors), rng.choice(territories),
+                         product, qty, price, sales, "Sales"])
+        # Purchase (restocking) transactions
+        for _ in range(20):
+            day = rng.integers(1, days_in_month + 1)
+            date = month_start.replace(day=int(day))
+            product = rng.choice(products)
+            qty = int(rng.integers(5, 40))
+            cost = unit_cost[product]
+            purchase_amt = round(qty * cost * rng.uniform(0.95, 1.05), 2)
+            rows.append([date, rng.choice(vendors), rng.choice(territories),
+                         product, qty, cost, purchase_amt, "Purchase"])
+
+    df = pd.DataFrame(rows, columns=[
+        "Date", "Vendor_Name", "Territory", "Product",
+        "Quantity", "Price_Pce", "Sales", "Type",
+    ])
     df["Month"] = df["Date"].dt.to_period("M").astype(str)
     return df
 
@@ -156,6 +179,7 @@ def generate_sample_data(n_months: int = 12) -> pd.DataFrame:
 # --------------------------------------------------------------------------
 @memory.cache
 def monthly_sales_analysis(df: pd.DataFrame) -> dict:
+    df = df[df["Type"] == "Sales"]
     monthly = (
         df.groupby("Month")
         .agg(Total_Sales=("Sales", "sum"), Orders=("Sales", "count"))
@@ -177,6 +201,7 @@ def monthly_sales_analysis(df: pd.DataFrame) -> dict:
 
 @memory.cache
 def monthly_product_analysis(df: pd.DataFrame) -> dict:
+    df = df[df["Type"] == "Sales"]
     monthly_product = (
         df.groupby(["Month", "Product"])
         .agg(Total_Sales=("Sales", "sum"), Units_Sold=("Quantity", "sum"))
@@ -208,6 +233,62 @@ def monthly_product_analysis(df: pd.DataFrame) -> dict:
         "monthly_product": monthly_product,
         "product_totals": product_totals,
         "top_per_month": top_per_month,
+        "summary": summary,
+    }
+
+
+@memory.cache
+def monthly_product_profit_analysis(df: pd.DataFrame) -> dict:
+    """
+    Profit per product per month = (sum of Sales rows' Sales amount)
+                                  - (sum of Purchase rows' Sales amount)
+    """
+    grouped = (
+        df[df["Type"].isin(["Sales", "Purchase"])]
+        .groupby(["Month", "Product", "Type"])["Sales"]
+        .sum()
+        .unstack("Type", fill_value=0)
+        .reset_index()
+    )
+    for col in ("Sales", "Purchase"):
+        if col not in grouped.columns:
+            grouped[col] = 0.0
+
+    grouped["Profit"] = grouped["Sales"] - grouped["Purchase"]
+    grouped = grouped.rename(columns={"Sales": "Revenue", "Purchase": "Cost"})
+    monthly_product_profit = grouped.sort_values(["Month", "Profit"], ascending=[True, False])
+
+    product_profit_totals = (
+        monthly_product_profit.groupby("Product")
+        .agg(Total_Revenue=("Revenue", "sum"), Total_Cost=("Cost", "sum"), Total_Profit=("Profit", "sum"))
+        .reset_index()
+        .sort_values("Total_Profit", ascending=False)
+    )
+
+    monthly_profit_overall = (
+        monthly_product_profit.groupby("Month")["Profit"]
+        .sum()
+        .reset_index()
+        .sort_values("Month")
+    )
+    monthly_profit_overall["Cumulative_Profit"] = monthly_profit_overall["Profit"].cumsum()
+
+    top_row = product_profit_totals.iloc[0] if not product_profit_totals.empty else None
+    bottom_row = product_profit_totals.iloc[-1] if not product_profit_totals.empty else None
+    summary = {
+        "total_profit": float(monthly_product_profit["Profit"].sum()),
+        "total_revenue": float(monthly_product_profit["Revenue"].sum()),
+        "total_cost": float(monthly_product_profit["Cost"].sum()),
+        "most_profitable_product": top_row["Product"] if top_row is not None else None,
+        "most_profitable_product_total": float(top_row["Total_Profit"]) if top_row is not None else 0.0,
+        "least_profitable_product": bottom_row["Product"] if bottom_row is not None else None,
+        "least_profitable_product_total": float(bottom_row["Total_Profit"]) if bottom_row is not None else 0.0,
+    }
+
+    return {
+        "monthly_product_profit": monthly_product_profit,
+        "product_profit_totals": product_profit_totals,
+        "monthly_profit_overall": monthly_profit_overall,
         "summary": summary,
     }
 
@@ -274,6 +355,48 @@ def show_monthly_product(df: pd.DataFrame):
     return result
 
 
+def show_monthly_product_profit(df: pd.DataFrame):
+    st.header("💰 Monthly Product Profit Over Time")
+    st.caption("Profit = Sales revenue (Type = 'Sales') − Purchase cost (Type = 'Purchase'), by product.")
+    result = monthly_product_profit_analysis(df)
+    monthly_product_profit = result["monthly_product_profit"]
+    product_profit_totals = result["product_profit_totals"]
+    monthly_profit_overall = result["monthly_profit_overall"]
+    summary = result["summary"]
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Total Profit", f"{summary['total_profit']:,.2f}")
+    c2.metric("Total Revenue", f"{summary['total_revenue']:,.2f}")
+    c3.metric("Total Cost", f"{summary['total_cost']:,.2f}")
+
+    if summary["most_profitable_product"] is not None:
+        c4, c5 = st.columns(2)
+        c4.metric("Most Profitable Product", summary["most_profitable_product"],
+                   f"{summary['most_profitable_product_total']:,.2f} profit")
+        c5.metric("Least Profitable Product", summary["least_profitable_product"],
+                   f"{summary['least_profitable_product_total']:,.2f} profit")
+
+    fig = px.line(monthly_product_profit, x="Month", y="Profit", color="Product",
+                  markers=True, title="Profit by Product Over Time")
+    st.plotly_chart(fig, use_container_width=True)
+
+    fig2 = px.line(monthly_profit_overall, x="Month", y="Cumulative_Profit",
+                   markers=True, title="Cumulative Profit Over Time (All Products)")
+    st.plotly_chart(fig2, use_container_width=True)
+
+    fig3 = px.bar(product_profit_totals, x="Product", y="Total_Profit",
+                  title="Total Profit by Product", text_auto=".2s")
+    st.plotly_chart(fig3, use_container_width=True)
+
+    st.subheader("Profit by Product per Month")
+    st.dataframe(monthly_product_profit, use_container_width=True)
+
+    st.subheader("Profit Totals by Product")
+    st.dataframe(product_profit_totals, use_container_width=True)
+
+    return result
+
+
 # --------------------------------------------------------------------------
 # Save / load processed results with joblib
 # --------------------------------------------------------------------------
@@ -317,7 +440,8 @@ def main():
         "Upload sales data (CSV or Excel)", type=["csv", "xlsx"]
     )
     st.sidebar.caption(
-        "Expected columns: **Date, Product, Sales, Quantity**"
+        "Expected columns: **Date, Vendor_Name, Territory, Product, "
+        "Quantity, Price_Pce, Sales, Type** (Type = 'Sales' or 'Purchase')"
     )
     use_sample = st.sidebar.button("Use sample data instead")
 
@@ -354,6 +478,10 @@ def main():
         results_to_save["monthly_product_analysis"] = show_monthly_product(df)
         st.divider()
 
+    if "Monthly Product Profit Analysis" in selected:
+        results_to_save["monthly_product_profit_analysis"] = show_monthly_product_profit(df)
+        st.divider()
+
     # Save / load section
     st.sidebar.header("3. Save / Load Results (joblib)")
     save_name = st.sidebar.text_input("Save current results as", value="latest_run")
@@ -376,6 +504,8 @@ def main():
                     st.dataframe(val["table"])
                 if "monthly_product" in val:
                     st.dataframe(val["monthly_product"])
+                if "monthly_product_profit" in val:
+                    st.dataframe(val["monthly_product_profit"])
                 st.json(val["summary"])
 
 
